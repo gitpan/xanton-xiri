@@ -1,0 +1,273 @@
+#!/usr/bin/perl
+# -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+# xanton: generate word index out of xml files.
+# (c) 2001 Ask Solem Hoel <ask@unixmonks.net>
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License version 2,
+#   *NOT* "earlier versions", as published by the Free Software Foundation.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+# -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#####
+
+# -------------------------------------------------------------------------------- #
+
+#%ifdef LIB
+#%print use lib '%{LIB}';
+#%else
+use lib 'include';
+#%endif
+
+use strict;
+#%ifdef HAVE_HTML_ENTITES
+#%print use HTML::Entities;
+#%endif
+use DB_File;
+use ProgressBar;
+use FileHandle;
+use LWP::Simple;
+require "asklib.ph";
+use vars qw($DEFAULT_WORD_DB $DEFAULT_FILE_DB $VERSION);
+use vars qw($opt_f $opt_w);
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+$|++;
+
+# prototypes
+sub basename($);
+
+#%ifndef VERSION
+#%die Missing VERSION, please fix Makefile."
+#%endif
+#%print $VERSION = '%{VERSION}';
+
+#%ifdef DEFAULT_WORD_DB
+#%print $DEFAULT_WORD_DB = '%{DEFAULT_WORD_DB}';
+#%else
+$DEFAULT_WORD_DB = 'xiri-word.db';
+#%endif
+
+#%ifdef DEFAULT_FILE_DB
+#%print $DEFAULT_FILE_DB = '%{DEFAULT_FILE_DB}';
+#%else
+$DEFAULT_FILE_DB = 'xiri-file.db';
+#%endif
+
+# ### remove the files in @cleanup at exit.
+my @cleanup = ();
+
+# -------------------------------------------------------------------------------- #
+
+## get command line arguments.
+my $me = basename $0;
+my $files = getfiles_from_argv(\@ARGV);
+usage(), exit unless $files;
+
+## open databases
+my $wdb = $opt_w || $DEFAULT_WORD_DB;
+my $fdb = $opt_f || $DEFAULT_FILE_DB;
+tie my %wdb, 'DB_File', $wdb, O_CREAT|O_RDWR, 0644, $DB_HASH;
+tie my %fdb, 'DB_File', $fdb, O_CREAT|O_RDWR, 0644, $DB_HASH;
+
+## index the files.
+foreach my $real_file (keys %$files) {
+	sindex($real_file, $files->{$real_file});
+}
+
+## close databases
+untie %wdb;
+untie %fdb;
+
+# remove temporary HTTP files.
+foreach(@cleanup) {
+	print STDERR "Deleting temporary file: $_\n";
+	unlink $_;
+}
+
+# -------------------------------------------------------------------------------- #
+
+sub sindex {
+	my($real_file, $final_file) = @_;
+	my $p = ProgressBar->new();
+
+	if(!open FH, $real_file) {
+		warn "Couldn't open $real_file: $!\n";
+		return undef;
+	}
+	my $filecontent;
+	{
+		local $/ = undef;
+		$filecontent = <FH>;
+	}
+	# remove HTML/XML
+	$filecontent =~ s/<(?:[^>'"]*|(['"]).*?\1)*>/ /gs;
+	# change punctation to spaces.
+	$filecontent =~ s/[\.,:;]/ /g;
+	my $fileid = filedb_getid_byfile($final_file);
+	unless($fileid) {
+		$fileid = filedb_getnext_id();
+		$fdb{$fileid} = $final_file;
+	}
+
+	my $lc = 0; # linecount
+	print STDERR "Indexing $real_file => $final_file... ";
+	foreach(split(/\n/, $filecontent)) { $lc++;
+		chomp;
+		next unless length;
+		my @words = split /\s+/, $_; 
+		foreach my $word (@words) {
+			$word = lc $word;
+			if(index($word, '&') != -1) {
+				#%ifdef HAVE_HTML_ENTITES
+				#%print $word = decode_entities($word);
+				#%else
+				$word =~ s/&.+?;//g;
+				#%endif
+			}
+			$word =~ s/[^\w\d]//g;
+			next unless length $word;
+			# must be atleast 2 chars.
+			next if length $word < 2; 
+			if($wdb{$word}) {
+				next if $wdb{$word} =~ /(^|#)$fileid(#|$)/;
+				$wdb{$word} .= "#$fileid";
+			}
+			else {
+				$wdb{$word} = "$fileid";
+			}
+		}
+		$p->jmp();
+	}
+	close FH;
+	$p->end();
+	print "\n";
+	undef $filecontent;
+}
+
+sub getfiles_from_argv {
+	my $argv = shift; # arrayref.
+	my(%files, @action);
+	while(@$argv) {
+		my $arg = shift @$argv;
+		if(substr($arg, 0, 1) eq '-') {
+			if(		$arg eq '--version'	or $arg eq '-V') {
+				usage(); exit;
+			}
+			elsif(	$arg eq '--help'	or $arg eq '-h') {
+				usage(); help(); exit;
+			}
+			elsif(	$arg eq '--word-db'	or $arg eq '-w') {
+				$opt_w = shift @$argv;
+			}
+			elsif(	$arg eq '--file-db'	or $arg eq '-f') {
+				$opt_f = shift @$argv;
+			}
+			elsif(	$arg eq '--strip-prefix'	or $arg eq '-s') {
+				push(@action, "sp:". quotemeta shift @$argv);
+			}
+			elsif(  $arg eq '--strip-suffix'    or $arg eq '-S') {
+				push(@action, "ss:". quotemeta shift @$argv);
+			}
+			elsif(  $arg eq '--add-prefix'      or $arg eq '-a') {
+				push(@action, "ap:". shift @$argv);
+			}
+			elsif(  $arg eq '--add-suffix'      or $arg eq '-A') {
+				push(@action, "as:". shift @$argv);
+			}
+			else {
+				usage();
+				print "$arg? I think you need --help!\n";
+				exit;
+			}
+		}
+		else {
+			if($arg =~ m#^http://#) {
+				my $filename = uniq_filename();
+				my $http_return = LWP::Simple::getstore($arg, $filename);
+				push @cleanup, $filename;
+				if($http_return == 200) {
+					$files{$filename} = $arg;
+				}
+				else {
+					warn("Skipping $arg: http $http_return\n");
+				}
+			}
+			else {
+				$files{$arg} = $arg;
+			}
+		last;
+		}
+	}
+	my $filecount = 0;
+	foreach(keys %files) { $filecount++;
+		foreach my $action (@action) {
+			my $action_type = substr($action, 0, 2);
+			my $action_patn = substr($action, 3, length $action);
+			if(     $action_type eq 'sp') {
+				$files{$_} =~ s/^$action_patn//g;
+			}
+			elsif(  $action_type eq 'ss') {
+				$files{$_} =~ s/$action_patn$//g;
+			}
+			elsif(  $action_type eq 'ap') {
+				$files{$_} = $action_patn . $files{$_};
+			}
+			elsif(  $action_type eq 'as') {
+				$files{$_} .= $action_patn;
+			}
+		}
+	}
+	return \%files if $filecount;
+}
+
+sub filedb_getnext_id {
+	my $id = 1;
+	while(exists $fdb{$id}) {
+		$id++
+	}
+	return $id;
+}
+
+sub filedb_getid_byfile {
+	my $filename = shift;
+	foreach my $fileid (keys %fdb) {
+		if($fdb{$fileid} eq $filename) {
+			return $fileid
+		}
+	}
+	return undef;
+}
+			
+sub usage {
+	print	"xanton v$VERSION - generate word index out of xml files.\n",
+			"(c) 2001 ask solem hoel <ask\@unixmonks.net>\n",	
+			"Usage: $me -[fwsaSAV] [--help|list of files]\n";
+}
+
+sub help {
+	print	"\n",
+			"-w|--word-db			Word database to store words in.\n",
+			"-f|--file-db			File database to store filenames in.\n",
+			"-s|--strip-prefix		Strip a pattern from the start of the filenames.\n",
+			"-S|--strip-suffix		Strip a pattern from the end the filenames.\n",
+			"-a|--add-prefix			Add a pattern to the start of the filenames.\n",
+			"-A|--add-suffix			Add a pattern to the end of the filanames.\n",
+			"-V|--version			Print version information and exit.\n",
+			"-h|--help			You're looking at it :).\n";
+}
+
+sub uniq_filename { my $filename;
+	do { 
+		$filename = sprintf("%0.2d%0.2d%d%d", int rand 64, int rand 64, time, $$);
+	} 
+	while(-f $filename);
+	return $filename;
+}

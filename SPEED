@@ -1,0 +1,37 @@
+xanton+xiri is probably not the fastest in the world,
+but it seems to be doing pretty fine - considering it's perl.
+
+I've tried several possibilites and it seems like DB_File::DB_HASH where
+the key is the word and the value is filenames and linenumbers
+separated like this: "file1:linenumber|file2:linenumber|file1:linenumber2"
+is the fastest so far.
+
+DB_File, DB_HASH on a 45mb index database:
+	o indexing very slow
+	o search apx. 1.5seconds
+
+GDBM_File, HASH on a 20mb index:
+	o indexing slow
+	o searching: apx. 6seconds.
+
+BerkeleyDB, DB_BTREE
+	o indexing slow
+	o searching: apx. 8seconds
+
+BerkeleyDB, DB_HASH 
+	o indexing slow
+	o searching: apx. 8seconds
+
+BerkeleyDB, DB_HASH, DB_DUP, DB_DUPSORT, one db for file and one db for word:
+	o indexing quick
+	o searching: apx. 10seconds, exact match faster.
+
+BerkeleyDB, DB_BTREE, DB_DUP, DB_DUPSORT, one db for file and one db for word:
+	o indexing quick
+	o searching: apx. 10seconds, exact match faster.
+
+BerkeleyDB, DB_BTREE, one db for file and one db for word:
+	o indexing quick
+	o searching: apx. 10seconds
+
+

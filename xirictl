@@ -1,0 +1,95 @@
+#!/bin/sh
+# -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+# xirictl: control the xiri http search daemon
+# (c) 2001 Ask Solem Hoel <ask@unixmonks.net>
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License version 2,
+#   *NOT* "earlier versions", as published by the Free Software Foundation.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+# -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#####
+
+#### get the prefix from pimpx
+#%ifdef PREFIX
+#%print PREFIX=%{PREFIX}
+#%else
+PREFIX=./
+#%endif
+
+#### get the pidfile from pimpx
+#%ifdef DEFAULT_PIDFILE
+#%print PIDFILE=%{DEFAULT_PIDFILE}
+#%else
+PIDFILE=xiri.pid
+#%endif
+
+#### get the program flags from pimpx
+#%ifdef XIRI_FLAGS
+#%print FLAGS=%{XIRI_FLAGS}
+#%else
+FLAGS=-D
+#%endif
+
+#### die unless version
+#%ifndef VERSION
+#%die Missing VERSION, please fix Makefile.
+#%endif
+#%print VERSION=%{VERSION}
+
+usage () {
+	echo "xirictl v$VERSION - xiri control utility";
+	echo "(c) 2001 ask solem hoel <ask@unixmonks.net>";
+	echo "usage: `basename $0` {start|stop|restart}";
+	exit;
+}
+
+if test -z "$1"; then usage; fi
+
+case $1 in
+	start)
+		if [ -f "$PIDFILE" ]; then
+			echo "Seems like she's already running. Please run stop first.";
+			exit
+		fi
+		echo -n "Starting Xiri... "
+		$PREFIX/sbin/xiri $FLAGS
+		sleep 2
+		if [ -f "$PIDFILE" ]; then
+			echo "success"
+		else
+			echo
+			echo "hmm. looks like I couldn't start her. check manually."
+		fi
+	;;
+	stop)
+		if [ -f "$PIDFILE" ]; then
+			pids=`cat $PIDFILE`
+			echo -n "Stopping Xiri... "
+			for pid in $pids
+			do
+				echo -n "$pid "
+				kill -TERM $pid 2>/dev/null
+			done
+			sleep 3
+			rm -f $PIDFILE
+			echo
+		else
+			echo "I don't think she's running right now."
+		fi
+	;;
+	restart)
+		$0 stop; $0 start
+	;;
+	*)
+		echo "Don't know how to $1";
+	;;	
+esac

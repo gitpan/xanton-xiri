@@ -1,0 +1,23 @@
+- [2001-25-11] ask@unixmonks.net 
+	o xanton: can now download files from http://.
+	o xiri: prints help from $PREFIX/home/help.html
+	o new utility: cleancache
+	o new utility: rmcache
+
+- [2001-23-11] ask@unixmonks.net
+	o xanton: new options, for stripping and adding prefices and suffices
+		to the filenames.
+	o xiri: Added cache
+	o xiri: Some code cleanup
+	o xiri: Tuning
+	o xiri: Boolean Search
+
+- [2001-16-11] ask@unixmonks.net 
+	o xanton: Fixed a bug with the html stripping that caused
+	  words to be joined.
+	o xanton+xiri: checked a few other methods of indexing, other database types
+	  and other database modules but found this one to be the quickest.
+	o xiri: added exact and index() search.
+
+- [2001-16-11] ask@unixmonks.net
+	o changelog starts here.

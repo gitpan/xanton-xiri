@@ -1,0 +1,6 @@
+* cleanup
+* POD Documentation
+% two databases; one for words and one for files.
+% xanton: make it possible to fetch from HTTP as well
+% xanton: strip-from-filename option
+% xiri: cache for boolean search

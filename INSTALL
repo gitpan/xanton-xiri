@@ -1,0 +1,121 @@
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++                         xanton+xiri                       +
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+1. What is xanton+xiri?
+  Xanton is a program for generating a word index out of a bunch of
+  XML files and storing it in a BerkeleyDB hash database.
+
+  Xiri is an HTTP server daemon for searching the index database and
+  outputting the results as XML.
+
+2. What do I need to run xanton+xiri?
+  Xanton+xiri requires the following programs/libraries to run:
+
+  o Perl 5.005 with BerkeleyDB support (should be default)
+
+  o pimpx - the perl inclusive macroprocessor.
+    fetch it from http://www.unixmonks.net/pimpx
+
+  In addition xanton+xiri requires the following perl modules:
+
+  o Time::HiRes
+    fetch it from CPAN with the command:
+    % perl -MCPAN -e'install Time::HiRes'
+
+  o HTML::Entities
+    fetch it from CPAN with the command: 
+    % perl -MCPAN -e'install HTML::Entities'
+
+  o LWP::Simple
+	fetch it from CPAN with the command:
+	% perl -MCPAN -e'install Bundle::LWP'
+
+3. How do I install it?
+  First you need to add the user and group xiri should run as:
+
+  % groupadd xiri
+  % useradd xiri -g xiri -m -d /opt/xiri -s /bin/bash
+
+  Then you need to become that user
+ 
+  % su - xiri
+
+  Make a directory for the source files and copy the source tarball to it.
+  Then extract the tarball.
+
+  $ mkdir src/
+  $ cp /usr/download/xanton+xiri-x.xx.tar.gz src/
+  $ cd src
+  $ tar xvfz xanton+xiri-x.xx.tar.gz
+  $ cd xanton+xiri-x.xx/
+
+  Review the Makefile for xanton+xiri and see if there is something
+  you need to change
+
+  $ vi Makefile
+
+  The following might be of interest here:
+
+  PERL - path to the perl interpreter.
+  PREFIX - path to the xiri users homedirectory.
+  PIMPX - path to the pimpx script.
+  PFLAGS - flags to pimpx
+  DEFAULT_PORT - default port for the xiri daemon (8889).
+  XIRI_FLAGS - options to give xiri at startup.
+  
+  When you're sure everything looks ok, execute the commands
+
+  $ make
+  $ make install  
+
+  If no errors appeared under the installation, everything should be ok.
+  You can now clean up the source directory:
+
+  $ make clean
+
+  Voila! Xanton+Xiri is installed :-)
+
+4. How do I use it?
+
+  First you need to index some xmlfiles.
+  If your xmlfiles are in /opt/html/mysite/xml you can make a script
+  to index all .xml files and strip the /opt/html/mysite part from the filename.
+
+  -- begin buildindex.sh --
+  #!/bin/sh
+  
+  # remove the old index database (not necessary)
+  rm -f /opt/xiri/var/db/xiri.db
+
+  # find xml files in the xmldir
+  xmlfiles=`find /opt/html/mysite/xml/ -name *.xml -print`
+  
+  # index each file
+  for file in $xmlfiles; do
+    stripfile=`echo $file | sed 's%/opt/html/mysite/'`
+    ( cd /opt/html/mysite ; /opt/xiri/bin/xanton $stripfile );
+  done
+  -- end buildindex.sh --
+
+  Run the script to index your xmlfiles
+
+  $ sh buildindex.sh
+ 
+  Then you just launch xiri in the background...
+
+  $ /opt/xiri/sbin/xirictl start
+
+  ...and point your browser to:
+
+  http://mymachine:8889/?search=searchstring&limit=40
+  http://mymachine:8889/?help=1
+
+  To stop xiri just execute the command
+
+  $ /opt/xiri/sbin/xirictl stop 
+
+   
+ 5. How do i get it?
+  xanton+xiris main distrubution site is at http://www.unixmonks.net/xanton+xiri/
+  

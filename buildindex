@@ -1,0 +1,8 @@
+#!/bin/sh
+
+files=`find /opt/xiri/mup/ -name "*.xml" -print`
+
+for file in $files
+do
+	xanton -s /opt/xiri/mup/ $file
+done

@@ -1,0 +1,738 @@
+#!/usr/bin/perl
+# -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+# xiri: xmlindex http search daemon
+# (c) 2001 Ask Solem Hoel <ask@unixmonks.net>
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License version 2, 
+#   *NOT* "earlier versions", as published by the Free Software Foundation.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+# -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#####
+
+# -------------------------------------------------------------------------------- #
+
+#%ifdef LIB
+#%print use lib '%{LIB}';
+#%else
+use lib 'include';
+#%endif
+
+use strict;
+use DB_File;
+use IO::Socket;
+use Symbol;
+use POSIX; 
+use Getopt::Std;
+use FileHandle;
+use Fcntl qw(:flock);
+use Time::HiRes qw(gettimeofday tv_interval);
+require "asklib.ph";
+use vars qw($me $PREFORK $MAX_CLIENTS_PER_CHILD %children $children);
+use vars qw($DOCUMENT_ROOT $DEFAULT_PORT $VERSION $DEFAULT_LOGFILE $DEFAULT_PIDFILE);
+use vars qw($DEFAULT_WORD_DB $DEFAULT_FILE_DB $CACHE_DB $CACHE_TIMESTAMP_DB);
+use vars qw($opt_f $opt_D $opt_F $opt_p $opt_P $opt_v $opt_l $opt_h $opt_V $opt_d $opt_x);
+
+$|++;
+
+# -------------------------------------------------------------------------------- #
+
+#%ifdef DEFAULT_PORT
+#%print $DEFAULT_PORT = %{DEFAULT_PORT}; 
+#%else
+$DEFAULT_PORT = 8889;
+#%endif
+
+#%ifndef VERSION
+#%die "Missing VERSION, please fix Makefile"
+#%endif
+#%print $VERSION = %{VERSION}; 
+
+#%ifdef DEFAULT_LOGFILE
+#%print $DEFAULT_LOGFILE = '%{DEFAULT_LOGFILE}'; 
+#%else
+$DEFAULT_LOGFILE = 'xiri.log';
+#%endif
+
+#%ifdef DEFAULT_WORD_DB
+#%print $DEFAULT_WORD_DB = '%{DEFAULT_WORD_DB}'; 
+#%else
+$DEFAULT_WORD_DB = 'xiri-word.db';
+#%endif
+
+#%ifdef DEFAULT_FILE_DB
+#%print $DEFAULT_FILE_DB = '%{DEFAULT_FILE_DB}'; 
+#%else
+$DEFAULT_FILE_DB = 'xiri-file.db';
+#%endif
+
+#%ifdef CACHE_DB 
+#%print $CACHE_DB = '%{CACHE_DB}';
+#%else
+$CACHE_DB = 'xiri-cache.db';
+#%endif
+
+#%ifdef CACHE_TIMESTAMP_DB
+#%print $CACHE_TIMESTAMP_DB = '%{CACHE_TIMESTAMP_DB}';
+#%else
+$CACHE_TIMESTAMP_DB = 'xiri-cache-timestamp.db';
+#%endif
+
+#%ifdef DEFAULT_PIDFILE
+#%print $DEFAULT_PIDFILE = '%{DEFAULT_PIDFILE}'; 
+#%else
+$DEFAULT_PIDFILE = 'xiri.pid';
+#%endif
+
+#%ifdef DOCUMENT_ROOT
+#%print $DOCUMENT_ROOT = '%{DOCUMENT_ROOT}';
+#%else
+$DOCUMENT_ROOT = 'html';
+#%endif
+
+# -------------------------------------------------------------------------------- #
+
+# prototypes
+sub xml_header;
+sub normal_header;
+sub print_version	();
+sub print_usage		();
+sub print_help		();
+sub parse_request	(@);
+sub basename		($);
+sub verbose		($);
+sub cleanexit		($);
+sub printlog		($$);
+sub not_implemented	($$$);
+
+# -------------------------------------------------------------------------------- #
+
+#################################
+### Get options
+# -D		Become a dæmon.
+# -F		Run in foreground.
+# -p		Port to bind to.
+# -P		Children to prefork.
+# -v		Give verbose messages to logfile.
+# -l		Path to logfile.
+# -h		Print help and exit.
+# -V		Print version info and exit.
+# -d		Word database file to use (Must be DB_HASH)
+# -f		File database file to use (Must be DB_HASH)
+# -x		Pidfile
+
+my $arguments = join(" ", @ARGV);
+getopts('DFvhVd:p:P:L:x:f:');
+$me = basename $0;
+
+if($opt_h) {
+	print_version;
+	print_usage;
+	print_help;
+	exit;
+}
+if($opt_V) {
+	print_version;
+	exit;
+}
+unless($opt_D or $opt_F) {
+	print_version;
+	print_usage;
+	exit;
+}
+
+my $port 	= $opt_p ||= $DEFAULT_PORT;
+my $logfile	= $opt_l ||= $DEFAULT_LOGFILE;
+my $wdb		= $opt_d ||= $DEFAULT_WORD_DB;
+my $fdb		= $opt_f ||= $DEFAULT_FILE_DB;
+my $pidfile	= $opt_x ||= $DEFAULT_PIDFILE;
+my $verbose	= $opt_v;
+$PREFORK	= $opt_P ||= 5;		# number of children to maintain
+%children	= (); 			# current child PIDs
+$children	= 0;			# current number of children
+$MAX_CLIENTS_PER_CHILD	= 5;		# number of clients each child should process
+
+# -------------------------------------------------------------------------------- #
+
+if(-f $pidfile) {
+	die "We're already running. Remove pidfile if sure.\n";
+}
+
+# open a log file.
+my $log = new FileHandle;
+$log->open(">>$logfile") or warn "Couldn't open log: $!\n";
+printlog $log, "You are running Xiri v$VERSION";
+printlog $log, "(c) 2001 Unixmonks.net";
+
+
+# dæmonize
+my $pid = $$;
+if($opt_D) {
+	verbose "Becoming a daemon...";
+	close(1); close(2); close(3);
+	$pid = fork;
+	exit if $pid;
+	POSIX::setsid();
+}
+
+open(PID, ">>$pidfile") or die "Couldn't open pidfile: $!\n";
+print PID "$$\n";
+close(PID);
+
+$0 = "[Xiri $arguments]";
+
+# ### open the index database
+verbose "Opening the index database";
+my $f = tie my %fdb, 'DB_File', $fdb, O_RDONLY, 0644, $DB_HASH;
+my $x = tie my %idb, 'DB_File', $wdb, O_RDONLY, 0644, $DB_HASH;
+
+# create a preforking server
+verbose "Binding to $port";
+my $server = IO::Socket::INET->new(
+	LocalPort	=> $port,
+	Type		=> SOCK_STREAM,
+	Proto		=> 'tcp',
+	Reuse		=> 1,
+	Listen		=> 10
+) or cleanexit "couldn't make a socket: $!\n";
+
+sub REAPER { # takes care of dead children
+	$SIG{CHLD} = \&REAPER;
+	my $pid = wait;
+	$children--;
+	delete $children{$pid};
+	verbose "Child $pid died, current children count is: $children";
+}
+
+sub HUNTSMAN { # signal handler for SIGINT
+	local($SIG{CHLD}) = 'IGNORE';
+	kill 'INT' => keys %children;
+	verbose "Oo.oO Time to die!";
+	unlink $pidfile;
+	cleanexit undef;
+}
+
+$SIG{CHLD} = \&REAPER;
+$SIG{INT} = \&HUNTSMAN;
+$SIG{TERM} = \&HUNTSMAN;
+
+for(1 .. $PREFORK) {
+	make_new_child();
+}
+
+while(1) {
+	sleep;
+	for(my $i = $children; $i < $PREFORK; $i++) {
+		make_new_child();
+	}
+}
+# -------------------------------------------------------------------------------- #
+
+sub make_new_child {
+	my($pid, $sigset);
+	verbose "Spawning a new child";
+
+	# block signal for fork
+	$sigset = POSIX::SigSet->new(SIGINT);
+	sigprocmask(SIG_BLOCK, $sigset)
+		or cleanexit "Can't block SIGINT for fork: $!\n";
+
+	cleanexit "fork: $!\n" unless defined ($pid = fork);
+
+	if($pid) {
+		# parent records the child's birth and returns.
+		sigprocmask(SIG_UNBLOCK, $sigset)
+			or cleanexit "Can't block SIGINT for fork: $!\n";
+		$children{$pid} = 1;
+		$children++;
+		return;
+	}
+	else {
+		# Child can *not* return from this subroutine.
+		$SIG{INT} = 'DEFAULT';
+		
+		# unblock signals
+		sigprocmask(SIG_UNBLOCK, $sigset)
+			or cleanexit "Cannot unblock SIGINT for fork: $!\n";
+
+		open(PID, ">>$pidfile") or warn "Child $pid can't write to pidfile: $!";
+		print PID "$$\n";
+		close(PID);
+
+		{
+		open(CHLOG, ">>$logfile") or warn "Child $pid can't write to logfile: $!";
+		CHLOG->autoflush(1);
+		# handle connections until we've reached max clients per child.
+		for(my $i = 0; $i < $MAX_CLIENTS_PER_CHILD; $i++) {
+			my $client = $server->accept() or last;
+			my $other_end = getpeername($client);
+			my ($port, $iaddr) = unpack_sockaddr_in($other_end);
+			my $remote_addr = inet_ntoa($iaddr);
+			my @request = ();
+			LINE:
+			while(my $msg = <$client>) {
+				$|++;
+				$msg =~ s/\n//g;
+				chop $msg;
+				if(@request) {
+					last LINE unless length $msg;
+				}
+				else {
+					next LINE unless length $msg;
+				}
+				push @request, $msg;
+			}
+			select($client);
+			my $r = parse_request @request;
+			select(STDOUT);
+			printlog \*CHLOG, "$remote_addr;$port: $r";
+			next;
+		}
+		close(CHLOG);
+		}
+		# child... remove your pid from the pidfile
+		if(open PID, $pidfile) {
+			flock(PID, LOCK_EX);
+			{
+				local $/ = undef;
+				my $pids = <PID>;
+				$pids =~ s/\b$$\b//g;
+				$pids =~ s/\s+/\n/g;
+				if(open PID, ">$pidfile") {
+					print PID $pids;
+				}
+			}
+			flock(PID, LOCK_UN);
+		}
+				
+		exit;
+	}
+}
+cleanexit(undef);
+
+sub printlog($$) {
+	my($log, $msg) = @_;
+	my $date = scalar localtime();
+	$date =~ s/\s+/:/g;
+	$pid ||= $$;
+	if(defined $log and ref $log) {
+		print $log "[$date] [$pid]: $msg\n";
+	}
+	return 1;
+}
+
+sub parse_querystring {
+	my $querystring = shift;
+	$querystring =~ s/^.*?\?(.*[^?])/$1/;
+	my %vars;
+	foreach(split '&', $querystring) {
+		my($key, $value) = split '=', $_;
+		$value =~ tr/+/ /;
+		$value =~ s/%([a-fA-F0-9][a-fA-F0-9])/pack("C",hex($1))/eg;
+		$vars{$key} = $value;
+	}
+	return \%vars;
+}
+	
+
+sub parse_request(@) {
+	my @request = @_;
+	my $cmdline = shift @request;
+	my($cmd, $dest, $ver) = split /\s+/, $cmdline, 3;
+	$dest	= lc $dest;
+	$cmd	= uc $cmd;
+	if($cmd eq 'GET') {
+		normal_header;
+		my $vars = parse_querystring($dest);
+		if($vars->{help}) {
+			print   qq{Content-Type: text/html\n\n};
+			if(-f "$DOCUMENT_ROOT/help.html") {
+				if(open(HTMLHELP, "$DOCUMENT_ROOT/help.html")) {
+					my $helpcontent;
+					{
+						local $/ = undef;
+						$helpcontent = <HTMLHELP>;
+					}
+					print $helpcontent, "\n";
+					close HTMLHELP;
+				}
+				else {
+					return "couldn't open help file in $DOCUMENT_ROOT/: $!";
+				}
+			}
+			return "asked for help :-)";
+		}
+		if($vars->{search}) {
+			print qq{Content-Type: text/xml\n\n};
+			my $time_start = [gettimeofday];
+			my $res = search(
+				$vars->{search},
+				$vars->{limit},
+				$vars->{exact},
+				$vars->{"index"},
+				$vars->{bool},
+			);
+			print_result($res, $vars->{silent});
+			my $time_end = [gettimeofday];
+			my $elapsed = tv_interval $time_start, $time_end;
+			return "GET $dest s=$vars->{search}, l=$vars->{limit}, t=${elapsed}sec";
+		}
+		else {
+			print qq{Content-Type: text/xml\n\n};
+			xml_header;
+			print qq{<error msg="Missing search pattern"/>\n};
+		}
+	}
+	elsif($cmd eq 'HEAD') {
+		normal_header;
+		print qq{Content-Type: text/xml\n\n};
+		return "HEAD $dest";
+	}
+	elsif($cmd eq 'POST') {
+		normal_header;
+		print qq{Content-Type: text/xml\n\n};
+		return "POST $dest";
+	}
+	else {
+		not_implemented $cmd, $dest, $cmdline;
+		return "$cmd $dest => NOT IMPLEMENTED, illegal request!";
+	}
+}
+
+sub normal_header {
+	print 	qq{HTTP/1.1 200 OK\n},
+		qq{Date: }. scalar localtime(). "\n",
+		qq{Server: xiri $VERSION (c) unixmonks\n},
+		qq{Last-Modified: }. scalar localtime(), "\n",
+		qq{Connection: close\n},
+}
+
+sub not_implemented($$$) {
+	my($cmd, $dest, $all) = @_;
+	print 	qq{HTTP/1.1 501 Method Not Implemented\n},
+		qq{Date: }. scalar localtime(). "\n",
+		qq{Server: xiri $VERSION (unixmonks)\n},
+		qq{Allow: GET, HEAD, POST\n},
+		qq{Connection: close\n},
+		qq{Transfer-Encoding: chunked\n},
+		qq{Content-Type: text/html; charset=iso-8859-1\n},
+		qq{\n};
+	print	qq{<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">\n},
+		qq{<html><head>\n},
+		qq{<title>501 Method not implemented</title>\n},
+		qq{</head><body>\n},
+		qq{<h1>Method not implemented</h1>\n},
+		qq{$cmd to $dest not supported.<p>\n},
+		qq{Invalid method in request: $all</p>\n},
+		qq{</body></html>\n};
+}
+	
+
+sub xml_header {
+	print qq{<?xml version="1.0" encoding="ISO-8859-1"?>\n};
+}
+
+sub print_result {
+	my($href, $silent) = @_;
+	xml_header;
+	print qq{<result>\n};
+
+	my $hits = 0;
+	if($silent) {
+		$hits = int %$href;
+	}
+	else {	
+		foreach my $match (sort keys %$href) {
+			$hits++;
+			print qq{\t<match number="$hits">\n};
+			print qq{\t\t<word>$match</word>\n};
+			print qq{\t\t<files>\n};
+			my @files = split /\#/, $href->{$match};
+			foreach my $fileid (@files) {
+				print qq(\t\t\t<file>$fdb{$fileid}</file>\n);
+			}
+			print qq{\t\t</files>\n};
+			print qq{\t</match>\n};
+		}
+	}
+	print qq{<total>$hits</total>\n};
+	print qq{</result>\n};
+}
+
+sub search {
+	my($search, $limit, $exact, $index, $boolean) = @_;
+	my $hits = 0;
+	if($boolean) {
+		my $expr = get_boolean_expr($search);
+		my $res = run_boolean_expr($x, $expr, $limit, $exact);
+		return $res;
+	}
+	else {
+		# try to get already cached search...
+		my $res = get_cache($search, $exact);
+		# if not, do a search and save results in the cache.
+		unless($res) {
+			my($key, $value, $status) = ("", "", undef);	
+			for(
+				$status = $x->seq($key, $value, R_FIRST);
+				$status == 0;
+				$status = $x->seq($key, $value, R_NEXT))
+			{
+				my $match = 0;
+				if($exact == 1) {
+					$match = 1 if $key eq $search;
+				}
+				elsif($index == 1) {
+					$match = 1 if index($key, $search) != -1;
+				}
+				else {
+					$match = 1 if $key =~ /$search/;
+				}
+				$res->{$key} = $value if $match;
+				if($limit > 0) {
+					last if $hits >= $limit;
+				};
+			}
+			save_cache($search, $res);
+		}
+		return $res;
+	}
+}
+
+sub get_cache {
+	my($search, $exact) = @_;
+	my %res;
+	my $got_cache = 0;
+	# ### open the cache database
+	my $y = tie my %cache, 'DB_File', $CACHE_DB, O_RDONLY, 0644, $DB_HASH;
+	my $z = tie my %ctime, 'DB_File', $CACHE_TIMESTAMP_DB, O_CREAT|O_RDWR, 0644, $DB_HASH;
+	# we do this for locking.
+	open CACHE_DB, $CACHE_DB;
+	open CACHE_TS_DB, $CACHE_TIMESTAMP_DB;
+	flock CACHE_DB, LOCK_SH or printlog \*CHLOG, "Couldn't flock cache: $!";
+	flock CACHE_TS_DB, LOCK_SH or printlog \*CHLOG, "Couldn't flock cache-ts: $!";
+	foreach(split /:/, $cache{$search}) {
+		my $value = "";
+		$x->get($_, $value);
+		if($exact) {
+			if($_ eq $search) {
+				printlog \*CHLOG, "Fetching exact key from db: $_";
+				$res{$_} = $value;
+				$got_cache = 1;
+			}
+		}
+		else {
+			$res{$_} = $value;
+			$got_cache = 1;
+		}
+	}
+	if($got_cache) {
+		$ctime{$search} = localtime;
+		$y->sync();
+		printlog \*CHLOG, "Cache of $search fetched";
+	}
+	flock CACHE_DB, LOCK_UN;
+	flock CACHE_TS_DB, LOCK_UN;
+	untie %cache;
+	untie %ctime;
+	close CACHE_DB;
+	close CACHE_TS_DB;	
+	return \%res if $got_cache;
+	return undef;
+}
+
+sub save_cache {
+	my($search, $res) = @_;
+	# ### open the cache database
+	my $y = tie my %cache, 'DB_File', $CACHE_DB, O_CREAT|O_RDWR, 0644, $DB_HASH;
+	my $z = tie my %ctime, 'DB_File', $CACHE_TIMESTAMP_DB, O_CREAT|O_RDWR, 0644, $DB_HASH;
+	# we do this for locking.
+	open CACHE_DB, $CACHE_DB;
+	open CACHE_TS_DB, $CACHE_TIMESTAMP_DB;
+	flock CACHE_DB, LOCK_EX or printlog \*CHLOG, "Couldn't flock cache: $!";
+	flock CACHE_TS_DB, LOCK_EX or printlog \*CHLOG, "Couldn't flock cache-ts: $!";
+	$cache{$search} = join(":", keys %$res);
+	$ctime{$search} = localtime;
+	$y->sync();
+	$z->sync();
+	flock CACHE_DB, LOCK_UN;
+	flock CACHE_TS_DB, LOCK_UN;
+	printlog \*CHLOG, "Cache of $search stored";
+	untie %cache;
+	untie %ctime;
+	close CACHE_DB;
+	close CACHE_TS_DB;	
+	return 1;
+}
+
+sub cleanexit($) {
+	my $msg = shift;
+	print $msg if $msg;
+	untie %idb;
+	untie %fdb;
+	if(defined $x) {
+		undef $x;
+	}
+	unlink $pidfile;
+	exit;
+}
+
+sub print_version() {
+	print 	qq{xiri v$VERSION - xmlindex search daemon\n},
+		qq{(c) 2001 ask solem hoel <ask\@unixmonks.net>\n};
+}
+
+sub print_usage() {
+	print qq{usage: `$me \{-D|-F\} [DPVpvlhd]'\n};
+}
+
+sub verbose($) {
+	printlog $log, shift if $verbose;
+}
+
+sub print_help() {
+	print "\n",
+		qq{-D	Launch in background.\n},
+		qq{-F	Launch in foreground.\n},
+		qq{-p	Port to bind to.\n},
+		qq{-P	Number of children to prefork.\n},
+		qq{-d	Index database to use.\n},
+		qq{-l	Path to logfile.\n},
+		qq{-l	Path to pidfile.\n},
+		qq{-v	Give verbose messages to logfile.\n},
+		qq{-h	Print help and exit.\n},
+		qq{-V	Print version info and exit.\n}
+	;
+}
+
+sub run_boolean_expr {
+	my($x, $pat_ref, $limit, $exact) = @_;
+	my @copy; 	# we can't work on the original
+			# since we change the array
+	my $count = 0;	# get db elements only on first expr.
+
+	my $result = {};
+	my($key, $value) = ("", "");
+	foreach my $expr (@$pat_ref) {
+		my $type = substr($expr, 0, 1);
+		my $pat  = substr($expr, 1, length $expr);
+		my $bool = $type eq '+' ? 1 : 0;
+		if($count == 0) {
+			$result = get_cache($pat, $exact);
+			unless($result) {	
+				my $status;
+				for(
+					$status = $x->seq($key, $value, R_FIRST);
+					$status == 0;
+					$status = $x->seq($key, $value, R_NEXT))
+				{
+					if(index($pat, '|') != -1) {
+						foreach my $subexpr (split /\|/, $pat) {
+							if(index($key, $subexpr) != -1) {
+								$result->{$key} = $value;
+							}
+						}
+					}
+					else {
+						if($key =~ /$pat/) {
+							$result->{$key} = $value;
+						}
+					}
+				}
+				save_cache($pat, $result);
+			}
+		}
+		else {
+			foreach my $subexpr (split /\|/, $pat) {
+				if($bool) {
+					if($exact) {
+						foreach(grep {$_ ne $subexpr} keys %$result) {
+							delete $result->{$_};
+						}
+					}
+					else {
+						foreach(grep {!/$subexpr/} keys %$result) {
+							delete $result->{$_};
+						}
+					}
+				}
+				else {
+					if($exact) {
+						foreach(grep {$_ eq $subexpr} keys %$result) {
+							delete $result->{$_};
+						}
+					}
+					else {
+						foreach(grep {/$subexpr/} keys %$result) {
+							delete $result->{$_};
+						}
+					}
+				}
+			}
+		}
+		$count++;
+
+		if($limit > 0) {
+			last if $count >= $limit;
+		}
+	}
+	return $result;
+}
+
+sub get_boolean_expr {
+        my $pat = shift; # search pattern
+        my @final; # final array of expressions
+
+        # turn i.e "net+work" into "net + work",
+        # or "net!work" into "net ! work".
+        $pat =~ s/[+&]/ + /g;
+        $pat =~ s/[-!]/ - /g;
+
+        # remove leading and trailing whitespace.
+        if(substr($pat, 0, 1) eq ' ') {
+                $pat =~ s/^\s+//;
+        }
+        if(substr($pat, length $pat, 1) eq ' ') {
+                $pat =~ s/\s+$//;
+        }
+
+        my @states = split /\s+/, $pat;
+        while(@states) {
+                my $cs = shift @states or last;
+                # if this is a boolean expresion, join the expression
+                # with the next argument.
+                if($cs eq 'AND' || $cs eq '+' || $cs eq '&') {
+                        push @final, '+'. shift @states;
+                }
+                elsif($cs eq 'OR' || $cs eq '|') {
+                        $final[$#final] .= '|'. shift @states;
+                }
+                elsif($cs eq 'NOT' || $cs eq '-' || $cs eq '!') {
+                        push @final, '-'. shift @states;
+                }
+                else {
+                        # exchange any &'s with +'s and !'s with -'s.
+                        $cs =~ s/^\&/+/;
+                        $cs =~ s/^!/-/;
+
+                        # if the pattern has no expression, it
+                        # defaults to AND.
+                        if(substr($cs, 0, 1) ne '-' || substr($cs, 0, 1) ne '+') {
+                                $cs = '+'. $cs;
+                        }
+                        push @final, $cs;
+                }
+        }
+        return \@final;
+}
+
+
+__END__
